@@ -429,8 +429,40 @@ namespace Hooks_NetPacket_UserStats {
             resp.ParseFromArray(pBody, cbBody);
         }
 
-        // 清除捐赠者的解锁状态，让客户端正确显示该游戏的所有成就列表（未解锁/进度0）
-        resp.clear_achievements();
+        // 注入 CloudRedirect 本地保存的成就状态；如果没有，则保持为 0 解锁
+        CloudRedirectHost::AchievementBlock blocks[64];
+        uint32_t n = CloudRedirectHost::GetAchievements(appId, blocks, 64);
+        if (n > 0) {
+            if (resp.achievements_size() > 0) {
+                for (int i = 0; i < resp.achievements_size(); i++) {
+                    auto* ach = resp.mutable_achievements(i);
+                    uint32_t block_idx = static_cast<uint32_t>(i / 32);
+                    uint32_t bit = static_cast<uint32_t>(i % 32);
+                    if (block_idx < n && (blocks[block_idx].bits & (1u << bit))) {
+                        ach->set_unlocked(true);
+                        ach->set_unlock_time(blocks[block_idx].unlockTimes[bit]);
+                    } else {
+                        ach->set_unlocked(false);
+                        ach->clear_unlock_time();
+                    }
+                }
+            } else {
+                for (uint32_t b = 0; b < n; b++) {
+                    for (uint32_t bit = 0; bit < 32; bit++) {
+                        if (blocks[b].bits & (1u << bit)) {
+                            auto* ach = resp.add_achievements();
+                            ach->set_internal_key(b * 32 + bit);
+                            ach->set_unlocked(true);
+                            ach->set_unlock_time(blocks[b].unlockTimes[bit]);
+                        }
+                    }
+                }
+            }
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: injected CR achievements for app {}", appId);
+        } else {
+            resp.clear_achievements();
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: cleared achievements (no CR data for app {})", appId);
+        }
         if (!resp.has_schema_version()) {
             resp.set_schema_version(1);
         }
@@ -492,12 +524,41 @@ namespace Hooks_NetPacket_UserStats {
         }
 
         resp.clear_stats();
-        g_NewBodySize = static_cast<uint32>(resp.ByteSizeLong());
-        if (!resp.SerializeToArray(const_cast<uint8*>(pBody), cbBody)){
-            LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to SerializeToArray modified response");
+
+        CloudRedirectHost::AchievementBlock blocks[64];
+        uint32_t n = CloudRedirectHost::GetAchievements(appId, blocks, 64);
+        if (n > 0) {
+            uint32_t crc = 0;
+            for (uint32_t i = 0; i < n; i++) {
+                auto* s = resp.add_stats();
+                s->set_stat_id(blocks[i].statId);
+                s->set_stat_value(blocks[i].bits);
+                for (uint32_t bit = 0; bit < 32; bit++) {
+                    if (blocks[i].bits & (1u << bit)) {
+                        auto* ut = s->add_unlock_times();
+                        ut->set_achievement_bit(bit);
+                        ut->set_unlock_time(blocks[i].unlockTimes[bit]);
+                    }
+                }
+                crc ^= blocks[i].bits ^ blocks[i].statId;
+            }
+            resp.set_crc_stats(crc);
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: injected {} CR achievement blocks for app {}", n, appId);
+        } else {
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: cleared stats (no CR data for app {})", appId);
+        }
+
+        auto newSize = resp.ByteSizeLong();
+        if (newSize <= cbBody && resp.SerializeToArray(const_cast<uint8*>(pBody), cbBody)) {
+            g_NewBodySize = static_cast<uint32>(newSize);
+            g_ResizedInPlace = true;
+        } else if (newSize <= sizeof(g_NewBody) && resp.SerializeToArray(g_NewBody, sizeof(g_NewBody))) {
+            g_cbNewBody = static_cast<uint32>(newSize);
+            g_NeedReplaceBody = true;
+        } else {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserStats response: failed to serialize modified response ({} bytes)", newSize);
             return;
         }
-        g_ResizedInPlace = true;
 
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats response: modified body:\n{}", resp.DebugString());
     }

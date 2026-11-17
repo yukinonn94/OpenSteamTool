@@ -436,13 +436,24 @@ namespace Hooks_NetPacket_UserStats {
             if (resp.achievements_size() > 0) {
                 for (int i = 0; i < resp.achievements_size(); i++) {
                     auto* ach = resp.mutable_achievements(i);
-                    uint32_t block_idx = static_cast<uint32_t>(i / 32);
-                    uint32_t bit = static_cast<uint32_t>(i % 32);
-                    if (block_idx < n && (blocks[block_idx].bits & (1u << bit))) {
-                        ach->set_unlocked(true);
-                        ach->set_unlock_time(blocks[block_idx].unlockTimes[bit]);
+                    uint32_t key = ach->internal_key();
+                    uint32_t statId = key >> 8;
+                    uint32_t bit = key & 0x1Fu;
+                    bool unlocked = false;
+                    uint32_t unlockTime = 0;
+                    for (uint32_t b = 0; b < n; b++) {
+                        if (blocks[b].statId == statId) {
+                            if (blocks[b].bits & (1u << bit)) {
+                                unlocked = true;
+                                unlockTime = blocks[b].unlockTimes[bit];
+                            }
+                            break;
+                        }
+                    }
+                    ach->set_unlocked(unlocked);
+                    if (unlocked) {
+                        ach->set_unlock_time(unlockTime);
                     } else {
-                        ach->set_unlocked(false);
                         ach->clear_unlock_time();
                     }
                 }
@@ -451,7 +462,7 @@ namespace Hooks_NetPacket_UserStats {
                     for (uint32_t bit = 0; bit < 32; bit++) {
                         if (blocks[b].bits & (1u << bit)) {
                             auto* ach = resp.add_achievements();
-                            ach->set_internal_key(b * 32 + bit);
+                            ach->set_internal_key((blocks[b].statId << 8) | bit);
                             ach->set_unlocked(true);
                             ach->set_unlock_time(blocks[b].unlockTimes[bit]);
                         }

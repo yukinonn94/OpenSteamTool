@@ -204,6 +204,7 @@ namespace {
     // ── Hash constants for target_job_name dispatch ─────────────
     constexpr uint32 HASH_JOB_NotifyRunningApps = Fnv1aHash("FamilyGroupsClient.NotifyRunningApps#1");
     constexpr uint32 HASH_JOB_GetUserStats = Fnv1aHash("Player.GetUserStats#1");
+    constexpr uint32 HASH_JOB_GetUserAchievements = Fnv1aHash("Player.GetUserAchievements#1");
     constexpr uint32 HASH_JOB_GetManifestRequestCode = Fnv1aHash("ContentServerDirectory.GetManifestRequestCode#1");
 
 } // anonymous namespace
@@ -279,15 +280,18 @@ namespace Hooks_NetPacket_AccessToken {
 // ════════════════════════════════════════════════════════════════
 //  Hooks_NetPacket_UserStats
 //
-//  Outgoing: CPlayer_GetUserStats_Request  (eMsg 151 -> target: Player.GetUserStats#1)
-//            CMsgClientGetUserStats        (eMsg 818)
-//  Incoming: CPlayer_GetUserStats_Response (eMsg 147 ← target: Player.GetUserStats#1)
-//            CMsgClientGetUserStatsResponse(eMsg 819)
+//  Outgoing: CPlayer_GetUserStats_Request        (eMsg 151 -> target: Player.GetUserStats#1)
+//            CPlayer_GetUserAchievements_Request (eMsg 151 -> target: Player.GetUserAchievements#1)
+//            CMsgClientGetUserStats              (eMsg 818)
+//  Incoming: CPlayer_GetUserStats_Response       (eMsg 147 ← target: Player.GetUserStats#1)
+//            CPlayer_GetUserAchievements_Response(eMsg 147 ← target: Player.GetUserAchievements#1)
+//            CMsgClientGetUserStatsResponse      (eMsg 819)
 // ════════════════════════════════════════════════════════════════
 namespace Hooks_NetPacket_UserStats {
 
     // jobid_source -> appid mapping (eMsg 151 request -> eMsg 147 response)
     std::unordered_map<uint64, AppId_t> g_JobIdToAppId;
+    std::unordered_map<uint64, AppId_t> g_JobIdToAppId_UserAchievements;
 
     // ── Send: CPlayer_GetUserStats_Request (eMsg 151) ──────────
     bool HandleSend_GetUserStats(const uint8* pBody, uint32 cbBody,
@@ -307,15 +311,18 @@ namespace Hooks_NetPacket_UserStats {
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: original body:\n{}", req.DebugString());
         
         AppId_t appId = req.appid();
-        bool hasShaSchema = req.has_sha_schema() && !req.sha_schema().empty();
-
-        if (hasShaSchema) {
-            LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: sha_schema is present, do not spoof");
-            return false;
-        }
         if (!LuaConfig::HasDepot(appId)) {
             LOG_ACHIEVEMENT_WARN("Player::GetUserStats request: appid={} is not in addappid", appId);
             return false;
+        }
+
+        // 清除客户端发送的 sha_schema 和 crc_stats，强制 Valve 服务器全量返回 schema
+        if (req.has_sha_schema() && !req.sha_schema().empty()) {
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: cleared sha_schema to force full schema for appid={}", appId);
+            req.clear_sha_schema();
+        }
+        if (req.has_crc_stats() && req.crc_stats() != 0) {
+            req.clear_crc_stats();
         }
 
         // Save jobid_source -> appid for the response handler
@@ -337,6 +344,104 @@ namespace Hooks_NetPacket_UserStats {
 
         LOG_ACHIEVEMENT_DEBUG("Player::GetUserStats request: modified body:\n{}", req.DebugString());
         return true;
+    }
+
+    // ── Send: CPlayer_GetUserAchievements_Request (eMsg 151) ──
+    bool HandleSend_GetUserAchievements(const uint8* pBody, uint32 cbBody,
+                                        const uint8* pHdr, uint32 cbHdr)
+    {
+        CPlayer_GetUserAchievements_Request req;
+        if (!req.ParseFromArray(pBody, cbBody)) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserAchievements request: failed to ParseFromArray");
+            return false;
+        }
+        if (!req.has_appid()) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserAchievements request: missing appid");
+            return false;
+        }
+
+        AppId_t appId = req.appid();
+        LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements request: original body:\n{}", req.DebugString());
+
+        if (!LuaConfig::HasDepot(appId)) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserAchievements request: appid={} is not in addappid", appId);
+            return false;
+        }
+
+        CMsgProtoBufHeader hdr;
+        if (hdr.ParseFromArray(pHdr, cbHdr) && hdr.has_jobid_source()) {
+            uint64 jobId = hdr.jobid_source();
+            g_JobIdToAppId_UserAchievements[jobId] = appId;
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements request: stored jobid={} -> appid={}", jobId, appId);
+        }
+
+        uint64_t newSteamId = LuaConfig::GetStatSteamId(appId);
+        req.set_steamid(newSteamId);
+
+        g_cbSendNewBody = static_cast<uint32>(req.ByteSizeLong());
+        if (!req.SerializeToArray(g_SendNewBody, kMaxBodySize)) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserAchievements request: failed to encode");
+            return false;
+        }
+
+        LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements request: modified body:\n{}", req.DebugString());
+        return true;
+    }
+
+    // ── Recv: CPlayer_GetUserAchievements_Response (eMsg 147) ─
+    void HandleRecv_GetUserAchievementsResponse(const uint8* pHdr, uint32 cbHdr,
+                                                const uint8* pBody, uint32 cbBody)
+    {
+        CMsgProtoBufHeader hdrMsg;
+        if (!hdrMsg.ParseFromArray(pHdr, cbHdr)) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserAchievements response: failed to ParseFromArray original header");
+            return;
+        }
+        LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: original header:\n{}", hdrMsg.DebugString());
+
+        AppId_t appId = 0;
+        bool hasAppId = false;
+        if (hdrMsg.has_jobid_target()) {
+            uint64 jobId = hdrMsg.jobid_target();
+            auto it = g_JobIdToAppId_UserAchievements.find(jobId);
+            if (it != g_JobIdToAppId_UserAchievements.end()) {
+                appId = it->second;
+                hasAppId = true;
+                LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: matched jobid={} -> appid={}", jobId, appId);
+                g_JobIdToAppId_UserAchievements.erase(it);
+            }
+        }
+
+        hdrMsg.set_eresult(static_cast<int32_t>(k_EResultOK));
+        g_cbNewHdr = static_cast<uint32>(hdrMsg.ByteSizeLong());
+        if (g_cbNewHdr > kMaxHdrSize || !hdrMsg.SerializeToArray(g_NewHdr, kMaxHdrSize))
+            return;
+        LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: modified header:\n{}", hdrMsg.DebugString());
+        g_NeedReplaceHdr = true;
+
+        if (!hasAppId || !LuaConfig::HasDepot(appId)) {
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: no appid match, skip body replace");
+            return;
+        }
+
+        CPlayer_GetUserAchievements_Response resp;
+        if (cbBody > 0) {
+            resp.ParseFromArray(pBody, cbBody);
+        }
+
+        // 清除捐赠者的解锁状态，让客户端正确显示该游戏的所有成就列表（未解锁/进度0）
+        resp.clear_achievements();
+        if (!resp.has_schema_version()) {
+            resp.set_schema_version(1);
+        }
+
+        g_cbNewBody = static_cast<uint32>(resp.ByteSizeLong());
+        if (g_cbNewBody > kMaxBodySize || !resp.SerializeToArray(g_NewBody, kMaxBodySize)) {
+            LOG_ACHIEVEMENT_WARN("Player::GetUserAchievements response: failed to serialize modified response");
+            return;
+        }
+        g_NeedReplaceBody = true;
+        LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: modified body:\n{}", resp.DebugString());
     }
 
     // ── Recv: CPlayer_GetUserStats_Response (eMsg 147) ─────────
@@ -1501,6 +1606,9 @@ namespace {
         case HASH_JOB_GetUserStats:
             return Hooks_NetPacket_UserStats::HandleSend_GetUserStats(pBody, cbBody, pHdr, cbHdr);
 
+        case HASH_JOB_GetUserAchievements:
+            return Hooks_NetPacket_UserStats::HandleSend_GetUserAchievements(pBody, cbBody, pHdr, cbHdr);
+
         case HASH_JOB_GetManifestRequestCode:
             return Hooks_NetPacket_Manifest::HandleSend(pBody, cbBody, pHdr, cbHdr);
 
@@ -1573,6 +1681,10 @@ namespace {
 
         case HASH_JOB_GetUserStats:
             Hooks_NetPacket_UserStats::HandleRecv_GetUserStatsResponse(pHdr, cbHdr, pBody, cbBody);
+            return;
+
+        case HASH_JOB_GetUserAchievements:
+            Hooks_NetPacket_UserStats::HandleRecv_GetUserAchievementsResponse(pHdr, cbHdr, pBody, cbBody);
             return;
 
         case HASH_JOB_GetManifestRequestCode:

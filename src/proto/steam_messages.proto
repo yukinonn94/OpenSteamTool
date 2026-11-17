@@ -163,6 +163,28 @@ message CPlayer_GetUserStats_Response {
 	repeated .CPlayer_GetUserStats_Response.Stats stats = 4;
 }
 
+// ============================================================
+// CPlayer_GetUserAchievements
+// ============================================================
+message CPlayer_GetUserAchievements_Request {
+	optional uint64 steamid = 1;
+	optional uint32 appid = 2;
+	optional string language = 3;
+}
+
+message CPlayer_GetUserAchievements_Response {
+	message Achievement {
+		optional uint32 internal_key = 1;
+		optional bool unlocked = 2;
+		optional fixed32 unlock_time = 3;
+		optional int32 progress_int = 4;
+		optional float progress_float = 5;
+	}
+
+	repeated .CPlayer_GetUserAchievements_Response.Achievement achievements = 1;
+	optional int32 schema_version = 2;
+}
+
 message CMsgClientGetUserStats {
 	optional fixed64 game_id = 1;
 	optional uint32 crc_stats = 2;

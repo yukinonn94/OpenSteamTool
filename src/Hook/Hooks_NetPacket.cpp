@@ -432,46 +432,20 @@ namespace Hooks_NetPacket_UserStats {
         // 注入 CloudRedirect 本地保存的成就状态；如果没有，则保持为 0 解锁
         CloudRedirectHost::AchievementBlock blocks[64];
         uint32_t n = CloudRedirectHost::GetAchievements(appId, blocks, 64);
+        resp.clear_achievements();
         if (n > 0) {
-            if (resp.achievements_size() > 0) {
-                for (int i = 0; i < resp.achievements_size(); i++) {
-                    auto* ach = resp.mutable_achievements(i);
-                    uint32_t key = ach->internal_key();
-                    uint32_t statId = key >> 8;
-                    uint32_t bit = key & 0x1Fu;
-                    bool unlocked = false;
-                    uint32_t unlockTime = 0;
-                    for (uint32_t b = 0; b < n; b++) {
-                        if (blocks[b].statId == statId) {
-                            if (blocks[b].bits & (1u << bit)) {
-                                unlocked = true;
-                                unlockTime = blocks[b].unlockTimes[bit];
-                            }
-                            break;
-                        }
-                    }
-                    ach->set_unlocked(unlocked);
-                    if (unlocked) {
-                        ach->set_unlock_time(unlockTime);
-                    } else {
-                        ach->clear_unlock_time();
-                    }
-                }
-            } else {
-                for (uint32_t b = 0; b < n; b++) {
-                    for (uint32_t bit = 0; bit < 32; bit++) {
-                        if (blocks[b].bits & (1u << bit)) {
-                            auto* ach = resp.add_achievements();
-                            ach->set_internal_key((blocks[b].statId << 8) | bit);
-                            ach->set_unlocked(true);
-                            ach->set_unlock_time(blocks[b].unlockTimes[bit]);
-                        }
+            for (uint32_t b = 0; b < n; b++) {
+                for (uint32_t bit = 0; bit < 32; bit++) {
+                    if (blocks[b].bits & (1u << bit)) {
+                        auto* ach = resp.add_achievements();
+                        ach->set_internal_key((blocks[b].statId << 8) | bit);
+                        ach->set_unlocked(true);
+                        ach->set_unlock_time(blocks[b].unlockTimes[bit]);
                     }
                 }
             }
-            LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: injected CR achievements for app {}", appId);
+            LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: injected {} CR achievements for app {}", resp.achievements_size(), appId);
         } else {
-            resp.clear_achievements();
             LOG_ACHIEVEMENT_DEBUG("Player::GetUserAchievements response: cleared achievements (no CR data for app {})", appId);
         }
         if (!resp.has_schema_version()) {
